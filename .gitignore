@@ -1,0 +1,18 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+mlruns/
+
+mlflow.db
+
+.DS_Store
+
+data/CPDB_data.pkl
