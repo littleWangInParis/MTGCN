@@ -1,0 +1,23 @@
+artifact_path: /Users/wangyuchen/Desktop/VSCode/jack-workspace/graduate/MTGCN/mlruns/2/models/m-3a79cd8d0bae41eba4307cef938d12dd/artifacts
+flavors:
+  python_function:
+    config:
+      device: null
+    data: data
+    env:
+      conda: conda.yaml
+      virtualenv: python_env.yaml
+    loader_module: mlflow.pytorch
+    pickle_module_name: mlflow.pytorch.pickle_module
+    python_version: 3.11.14
+  pytorch:
+    code: null
+    model_data: data
+    pytorch_version: 2.9.1
+mlflow_version: 3.7.0
+model_id: m-3a79cd8d0bae41eba4307cef938d12dd
+model_size_bytes: 20939530
+model_uuid: m-3a79cd8d0bae41eba4307cef938d12dd
+prompts: null
+run_id: 39b038e35ecb4b878997ae75c0ca97b6
+utc_time_created: '2025-12-11 14:39:23.003597'
