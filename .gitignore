@@ -12,3 +12,5 @@ wheels/
 mlruns/
 
 mlflow.db
+
+.DS_Store
