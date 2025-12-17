@@ -16,3 +16,5 @@ mlflow.db
 .DS_Store
 
 data/CPDB_data.pkl
+
+best_model.pt

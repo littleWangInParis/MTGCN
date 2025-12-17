@@ -8,8 +8,8 @@ import torch
 import torch.nn.functional as F
 from torch.nn import Linear
 
-# --- 导入 GATv2Conv ---
-from torch_geometric.nn import GATv2Conv, BatchNorm
+# --- [修改] 导入 TransformerConv ---
+from torch_geometric.nn import TransformerConv, BatchNorm
 from torch_geometric.utils import (
     dropout_edge,
     negative_sampling,
@@ -21,24 +21,25 @@ from sklearn import metrics
 import mlflow
 
 # ==========================================
-# 1. 参数配置 (优化版)
+# 1. 参数配置 (针对 Graph Transformer 调整)
 # ==========================================
 CONFIG = {
-    "EPOCH": 2000,  # GAT 收敛可能慢一点，或者早停
-    "LR": 0.001,  # [修改] GAT 建议使用较小的学习率 (0.001 或 0.0005)
-    "WEIGHT_DECAY": 1e-4,  # [新增] 强正则化防止过拟合
-    "DROPOUT_EDGE": 0.1,  # [微调] 边 Dropout 不宜过大，否则破坏结构
-    "DROPOUT_FEAT": 0.2,  # 特征 Dropout
-    "DROPOUT_ATT": 0.5,  # [关键] 注意力系数的 Dropout
-    "HIDDEN_1": 64,  # 每个头的维度
+    "EPOCH": 2000,
+    "LR": 0.0005,  # [建议] Transformer 通常需要比 GAT 更小的学习率，或者配合 Warmup
+    "WEIGHT_DECAY": 1e-4,
+    "DROPOUT_EDGE": 0.1,
+    "DROPOUT_FEAT": 0.2,
+    "DROPOUT_ATT": 0.3,  # Transformer 内部的 Dropout
+    "HIDDEN_1": 64,
     "HIDDEN_2": 32,
-    "HEADS": 4,  # 多头数量
+    "HEADS": 4,  # 多头注意力数量
+    "BETA": True,  # [新增] 是否开启门控机制，Graph Transformer 的关键特性
     "LINEAR_HIDDEN": 100,
     "SEED": 42,
     "TARGET_RUN": 0,
     "TARGET_FOLD": 0,
-    "SCHEDULER_PATIENCE": 10,  # [修改] 配合验证频率，10*10=100 epoch 不提升则降 LR
-    "NOTE": "GATv2 Optimization with BatchNorm and Scheduler v5",
+    "SCHEDULER_PATIENCE": 10,
+    "NOTE": "Graph Transformer with Gating and Aux Loss",
     "EXP_NAME": 251215,
 }
 
@@ -54,10 +55,16 @@ def set_seed(seed):
         print(f"Random seed set to: {seed}")
 
 
-device = torch.device("cpu")
+device = torch.device("cpu")  # 如果有GPU请改为 "cuda"
 
 print("Loading data...")
-data = torch.load("./CPDB_data_v2.pt", weights_only=False)
+# 假设文件路径保持不变
+try:
+    data = torch.load("./CPDB_data_v2.pt", weights_only=False)
+except FileNotFoundError:
+    # 为了防止报错，如果没有文件，这里仅作占位，实际运行时请确保文件存在
+    print("Warning: Data file not found. Please ensure './CPDB_data_v2.pt' exists.")
+    exit()
 
 y_all = np.logical_or(data.y, data.y_te)
 Y = torch.tensor(y_all).type(torch.float32).to(device)
@@ -73,14 +80,22 @@ mask_all = (mask_tensor | mask_te_tensor).to(device)
 
 data.x = data.x[:, :48]
 
-datas = torch.load("./data/str_fearures.pkl", map_location="cpu")
-data.x = torch.cat((data.x, datas), 1)
+try:
+    datas = torch.load("./data/str_fearures.pkl", map_location="cpu")
+    data.x = torch.cat((data.x, datas), 1)
+except FileNotFoundError:
+    print("Warning: Feature file not found.")
+    exit()
 
 data.x = data.x.float()
 data = data.to(device)
 
-with open("./data/k_sets.pkl", "rb") as handle:
-    k_sets = pickle.load(handle)
+try:
+    with open("./data/k_sets.pkl", "rb") as handle:
+        k_sets = pickle.load(handle)
+except FileNotFoundError:
+    print("Warning: k_sets file not found.")
+    exit()
 
 # 处理自环
 pb, _ = remove_self_loops(data.edge_index)
@@ -92,52 +107,58 @@ num_edges = pb.size(1)
 
 
 # ==========================================
-# 4. 模型定义 (GATv2 + BatchNorm)
+# 4. 模型定义 (Graph Transformer)
 # ==========================================
-class GATNet(torch.nn.Module):
+class GraphTransformerNet(torch.nn.Module):
     def __init__(self):
-        super(GATNet, self).__init__()
+        super(GraphTransformerNet, self).__init__()
 
         in_channels = data.x.size(1)
 
-        # --- Layer 1 ---
-        self.conv1 = GATv2Conv(
+        # --- Layer 1: TransformerConv ---
+        # TransformerConv 参数: in, out, heads, dropout, beta(门控)
+        self.conv1 = TransformerConv(
             in_channels,
             CONFIG["HIDDEN_1"],
             heads=CONFIG["HEADS"],
             dropout=CONFIG["DROPOUT_ATT"],
+            beta=CONFIG["BETA"],  # 开启门控
             concat=True,
         )
-        # [新增] Batch Norm 1
-        # 输入维度是 HIDDEN_1 * HEADS
+
+        # Batch Norm 1
         self.bn1 = BatchNorm(CONFIG["HIDDEN_1"] * CONFIG["HEADS"])
 
-        # --- Layer 2 ---
-        self.conv2 = GATv2Conv(
+        # --- Layer 2: TransformerConv ---
+        self.conv2 = TransformerConv(
             CONFIG["HIDDEN_1"] * CONFIG["HEADS"],
             CONFIG["HIDDEN_2"],
             heads=CONFIG["HEADS"],
             dropout=CONFIG["DROPOUT_ATT"],
+            beta=CONFIG["BETA"],
             concat=True,
         )
-        # [新增] Batch Norm 2
+
+        # Batch Norm 2
         self.bn2 = BatchNorm(CONFIG["HIDDEN_2"] * CONFIG["HEADS"])
 
-        # --- Layer 3 (Output) ---
-        self.conv3 = GATv2Conv(
+        # --- Layer 3 (Output): TransformerConv ---
+        # 最后一层通常 heads=1 或者 concat=False 并求平均
+        # 这里为了保持输出维度为 1，我们设 heads=1
+        self.conv3 = TransformerConv(
             CONFIG["HIDDEN_2"] * CONFIG["HEADS"],
             1,
             heads=1,
             dropout=CONFIG["DROPOUT_ATT"],
+            beta=CONFIG["BETA"],
             concat=False,
         )
 
-        # 辅助线性层
+        # 辅助线性层 (用于重构 Loss)
         self.gat_out_dim = CONFIG["HIDDEN_2"] * CONFIG["HEADS"]
-        self.lin1 = Linear(in_channels, self.gat_out_dim)
-        self.lin2 = Linear(in_channels, self.gat_out_dim)
+        # 注意：这里不需要改动太多，只要维度对齐即可
 
-        # 可学习参数
+        # 可学习参数 (保持不变)
         self.c1 = torch.nn.Parameter(torch.Tensor([0.5]))
         self.c2 = torch.nn.Parameter(torch.Tensor([0.5]))
 
@@ -154,19 +175,19 @@ class GATNet(torch.nn.Module):
 
         # Layer 1
         x = self.conv1(x0, edge_index)
-        x = self.bn1(x)  # [新增] BN
+        x = self.bn1(x)
         x = F.elu(x)
         x = F.dropout(x, p=CONFIG["DROPOUT_FEAT"], training=self.training)
 
         # Layer 2
         x1 = self.conv2(x, edge_index)
-        x1 = self.bn2(x1)  # [新增] BN
+        x1 = self.bn2(x1)
         x1 = F.elu(x1)
 
         x_skip = z = x1
 
         # --- Loss Calculation (Auxiliary) ---
-        # 这里的重构 Loss 计算量较大，如果显存不够可以适当优化
+        # 这里的逻辑保持完全一致
         pos_loss = -torch.log(
             torch.sigmoid((z[E[0]] * z[E[1]]).sum(dim=1)) + 1e-15
         ).mean()
@@ -188,24 +209,21 @@ class GATNet(torch.nn.Module):
 
 
 # ==========================================
-# 5. 训练与测试函数
+# 5. 训练与测试函数 (保持不变)
 # ==========================================
 def train(mask, model, optimizer, pos_weight):
     model.train()
     optimizer.zero_grad()
     pred, rl, c1, c2 = model()
 
-    # 主分类 Loss
     main_loss = F.binary_cross_entropy_with_logits(
         pred[mask], Y[mask], pos_weight=pos_weight
     )
 
-    # 联合 Loss
     loss = main_loss / (c1 * c1) + rl / (c2 * c2) + 2 * torch.log(c2 * c1)
-    # loss = main_loss
     loss.backward()
 
-    # [新增] 梯度裁剪：防止 GAT 梯度爆炸
+    # 梯度裁剪
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
     optimizer.step()
@@ -219,7 +237,6 @@ def test(mask, model):
     pred = torch.sigmoid(x[mask]).cpu().detach().numpy()
     Yn = Y[mask].cpu().numpy()
 
-    # 防止 NaN
     if np.isnan(pred).any():
         print("Warning: NaN detected in predictions")
         pred = np.nan_to_num(pred)
@@ -243,7 +260,6 @@ with mlflow.start_run(run_name=CONFIG["NOTE"]):
     tr_mask = torch.as_tensor(tr_mask).to(device)
     te_mask = torch.as_tensor(te_mask).to(device)
 
-    # 计算 pos_weight
     train_labels = Y[tr_mask]
     num_pos = train_labels.sum()
     num_neg = (train_labels == 0).sum()
@@ -251,14 +267,13 @@ with mlflow.start_run(run_name=CONFIG["NOTE"]):
     pos_weight = torch.tensor([weight_value]).to(device)
     print(f"Pos Weight: {weight_value:.4f}")
 
-    model = GATNet().to(device)
+    # [修改] 实例化 Graph Transformer
+    model = GraphTransformerNet().to(device)
 
-    # [修改] 加入 Weight Decay
     optimizer = torch.optim.Adam(
         model.parameters(), lr=CONFIG["LR"], weight_decay=CONFIG["WEIGHT_DECAY"]
     )
 
-    # [新增] 学习率调度器
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="max",
@@ -267,7 +282,7 @@ with mlflow.start_run(run_name=CONFIG["NOTE"]):
     )
 
     time_start = time.time()
-    loop = tqdm(range(1, CONFIG["EPOCH"] + 1), desc="Training GAT", dynamic_ncols=True)
+    loop = tqdm(range(1, CONFIG["EPOCH"] + 1), desc="Training GT", dynamic_ncols=True)
 
     best_auc = 0
     best_epoch = 0
@@ -276,7 +291,6 @@ with mlflow.start_run(run_name=CONFIG["NOTE"]):
         loss_val = train(tr_mask, model, optimizer, pos_weight)
         mlflow.log_metric("train_loss", loss_val, step=epoch)
 
-        # 每 50 个 epoch 验证一次
         if epoch % 50 == 0:
             train_auc, train_aupr = test(tr_mask, model)
             val_auc, val_aupr = test(te_mask, model)
@@ -286,14 +300,12 @@ with mlflow.start_run(run_name=CONFIG["NOTE"]):
                 step=epoch,
             )
 
-            # 更新 Scheduler (根据 AUC 调整学习率)
             scheduler.step(val_auc)
 
             if val_auc > best_auc:
                 best_auc = val_auc
                 best_epoch = epoch
-                # 保存最佳模型
-                # torch.save(model.state_dict(), "best_gat_model.pth")
+                # torch.save(model.state_dict(), "best_gt_model.pth")
 
             loop.set_postfix(
                 loss=f"{loss_val:.4f}",
